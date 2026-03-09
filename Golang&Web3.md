@@ -98,5 +98,354 @@ r := gin.New() // 使用 gin.New() 而非 gin.Default()，手动控制中间件
    8） 死信队列。 Worker处理失败的log，不能直接丢弃。 入死信队列，人工参与分析。
 
 ## goeth库
+   1） 节点相关 
 
+```
+// HTTP
+client, err := ethclient.Dial("https://mainnet.infura.io/v3/KEY")
 
+// WebSocket（订阅用）
+client, err := ethclient.Dial("wss://mainnet.infura.io/ws/v3/KEY")
+
+// IPC（本地节点，延迟最低）
+client, err := ethclient.Dial("/var/run/geth.ipc")
+
+// 带超时的连接
+client, err := ethclient.DialContext(ctx, rpcURL)
+
+// 底层 rpc.Client（需要 batch 调用时用）
+rpcClient, err := rpc.DialContext(ctx, rpcURL)
+
+// 关闭连接
+client.Close()
+
+// 获取 ChainID
+chainID, err := client.ChainID(ctx)
+
+// 获取网络 ID
+networkID, err := client.NetworkID(ctx)
+```
+
+  2) 查区块数据
+
+```
+// 最新块高
+blockNum, err := client.BlockNumber(ctx)
+
+// 按块号查区块（含完整交易）
+block, err := client.BlockByNumber(ctx, big.NewInt(18000000))
+block, err := client.BlockByNumber(ctx, nil)              // nil = 最新块
+
+// 按 Hash 查区块
+block, err := client.BlockByHash(ctx, blockHash)
+
+// 只查块头（不含交易，更轻量）
+header, err := client.HeaderByNumber(ctx, nil)
+header, err := client.HeaderByHash(ctx, blockHash)
+header.Number    // 块高
+header.Time      // 时间戳
+header.BaseFee   // EIP-1559 baseFee
+
+// 查块内交易数量
+count, err := client.TransactionCount(ctx, blockHash)
+
+// 按块内索引查交易
+tx, err := client.TransactionInBlock(ctx, blockHash, index)
+```
+
+   3) 查交易数据
+
+```
+// 按 Hash 查交易
+tx, isPending, err := client.TransactionByHash(ctx, txHash)
+isPending        // true = 还在 mempool，未打包
+
+// 查交易收据（已上链才有）
+receipt, err := client.TransactionReceipt(ctx, txHash)
+receipt.Status        // 1=成功 0=revert
+receipt.GasUsed       // 实际消耗 Gas
+receipt.Logs          // 产生的所有 Log
+receipt.BlockNumber   // 打包进哪个块
+receipt.ContractAddress // 如果是部署合约，这里有合约地址
+```
+
+   4) 查庄户数据
+
+```
+// 查 ETH 余额
+balance, err := client.BalanceAt(ctx, address, nil)           // 最新块
+balance, err := client.BalanceAt(ctx, address, blockNumber)   // 指定块（归档节点）
+
+// 查已确认 Nonce
+nonce, err := client.NonceAt(ctx, address, nil)
+
+// 查 Pending Nonce（发交易用这个）
+nonce, err := client.PendingNonceAt(ctx, address)
+
+// 查合约字节码
+code, err := client.CodeAt(ctx, address, nil)
+isContract := len(code) > 0
+
+// 查合约存储槽（读原始 storage）
+value, err := client.StorageAt(ctx, address, slotHash, nil)
+
+// 查 Pending 余额
+balance, err := client.PendingBalanceAt(ctx, address)
+```
+
+   5) 查eventlog
+
+```
+// 查历史 Log（HTTP）
+logs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
+    FromBlock: big.NewInt(18000000),
+    ToBlock:   big.NewInt(18001000),
+    Addresses: []common.Address{contractAddr},
+    Topics:    [][]common.Hash{{eventSig}},
+})
+
+// 订阅实时 Log（WebSocket）
+logsCh := make(chan types.Log, 1000)
+sub, err := client.SubscribeFilterLogs(ctx, ethereum.FilterQuery{
+    Addresses: []common.Address{contractAddr},
+    Topics:    [][]common.Hash{{eventSig}},
+}, logsCh)
+sub.Err()        // 监听订阅错误
+sub.Unsubscribe()// 取消订阅
+
+// 订阅新块头（WebSocket）
+headersCh := make(chan *types.Header, 100)
+sub, err := client.SubscribeNewHead(ctx, headersCh)
+```
+
+   6) gas相关
+
+```
+// 估算 Gas Limit
+gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{
+    From: fromAddr,
+    To:   &toAddr,
+    Data: calldata,
+})
+
+// 建议 Gas Price（Legacy，适合 BSC 等）
+gasPrice, err := client.SuggestGasPrice(ctx)
+
+// 建议 Priority Fee（EIP-1559，适合 ETH 主网）
+gasTipCap, err := client.SuggestGasTipCap(ctx)
+
+// baseFee 从 Header 里取
+header, _ := client.HeaderByNumber(ctx, nil)
+baseFee := header.BaseFee
+
+// maxFeePerGas = 2 * baseFee + priorityFee
+gasFeeCap := new(big.Int).Add(
+    new(big.Int).Mul(baseFee, big.NewInt(2)),
+    gasTipCap,
+)
+```
+
+  7) 构建交易
+
+```
+// Legacy 交易（Type 0，BSC/旧链用）
+tx := types.NewTransaction(
+    nonce,
+    toAddr,
+    value,
+    gasLimit,
+    gasPrice,
+    data,
+)
+
+// EIP-1559 交易（Type 2，ETH 主网推荐）
+tx := types.NewTx(&types.DynamicFeeTx{
+    ChainID:   chainID,
+    Nonce:     nonce,
+    To:        &toAddr,
+    Value:     value,
+    Gas:       gasLimit,
+    GasTipCap: gasTipCap,   // priority fee
+    GasFeeCap: gasFeeCap,   // max fee
+    Data:      data,
+})
+
+// 部署合约（To 为 nil）
+tx := types.NewTx(&types.DynamicFeeTx{
+    ChainID:  chainID,
+    Nonce:    nonce,
+    To:       nil,           // nil = 部署合约
+    Value:    big.NewInt(0),
+    Gas:      gasLimit,
+    Data:     contractBytecode,
+})
+```
+
+   8) 签名
+```
+// 从私钥构建签名器
+signer := types.LatestSignerForChainID(chainID)
+
+// 签名交易
+signedTx, err := types.SignTx(tx, signer, privateKey)
+
+// 从私钥获取地址
+fromAddr := crypto.PubkeyToAddress(privateKey.PublicKey)
+
+// 签名任意消息（EIP-191 personal_sign）
+msg := "Login to MyApp: 1234567890"
+msgHash := crypto.Keccak256([]byte(
+    "\x19Ethereum Signed Message:\n" +
+    strconv.Itoa(len(msg)) + msg,
+))
+sig, err := crypto.Sign(msgHash, privateKey)
+sig[64] += 27  // 调整 v 值
+
+// 从签名恢复公钥
+pubKey, err := crypto.SigToPub(msgHash, sig)
+
+// 从签名恢复地址
+recoveredAddr := crypto.PubkeyToAddress(*pubKey)
+
+// 验证签名（对比恢复地址和声明地址）
+isValid := recoveredAddr == claimedAddr
+
+// 生成新私钥
+privateKey, err := crypto.GenerateKey()
+
+// 从 hex 加载私钥
+privateKey, err := crypto.HexToECDSA("私钥hex字符串")
+
+// 计算任意数据的 Keccak256 哈希
+hash := crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))
+```
+
+   9) 发送交易
+
+```
+// 广播已签名交易
+err := client.SendTransaction(ctx, signedTx)
+
+// 获取 txHash
+txHash := signedTx.Hash()
+
+// 等待交易被打包（轮询 Receipt）
+func waitMined(client *ethclient.Client, txHash common.Hash) (*types.Receipt, error) {
+    for {
+        receipt, err := client.TransactionReceipt(ctx, txHash)
+        if err == nil {
+            return receipt, nil  // 已打包
+        }
+        time.Sleep(2 * time.Second)
+    }
+}
+
+// Batch 发送多个 RPC 请求（底层 rpc.Client）
+batch := []rpc.BatchElem{
+    {Method: "eth_getBalance", Args: []any{addr1, "latest"}, Result: &bal1},
+    {Method: "eth_getBalance", Args: []any{addr2, "latest"}, Result: &bal2},
+}
+err := rpcClient.BatchCallContext(ctx, batch)
+```
+
+   10) ABI编码解码
+
+```
+// 解析 ABI
+contractABI, err := abi.JSON(strings.NewReader(abiJSON))
+
+// 编码函数调用（生成 calldata）
+data, err := contractABI.Pack("transfer", toAddr, amount)
+
+// 解码返回值
+var result *big.Int
+err = contractABI.UnpackIntoInterface(&result, "balanceOf", returnData)
+
+// 解码到 map
+output := make(map[string]interface{})
+err = contractABI.UnpackIntoMap(output, "transfer", returnData)
+
+// 解析 Log（非 indexed 参数从 Data 解码）
+event := make(map[string]interface{})
+err = contractABI.UnpackIntoMap(event, "Transfer", log.Data)
+
+// 计算事件签名 hash（Topics[0]）
+eventSig := contractABI.Events["Transfer"].ID
+// 或手动计算
+eventSig := crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))
+```
+
+   11) 合约调用（bind 层）
+
+```
+// ── abigen 生成的 binding ────────────────────────────
+
+// 实例化合约
+token, err := erc20.NewErc20(contractAddr, client)
+
+// 读操作（CallOpts）
+opts := &bind.CallOpts{
+    Context:     ctx,
+    BlockNumber: nil,      // nil = 最新块
+    From:        fromAddr, // 模拟 msg.sender
+    Pending:     false,    // 是否查 pending 状态
+}
+balance, err := token.BalanceOf(opts, userAddr)
+
+// 写操作（TransactOpts）
+auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+auth.Context  = ctx
+auth.Nonce    = big.NewInt(int64(nonce))
+auth.GasLimit = uint64(100000)
+auth.GasPrice = gasPrice    // Legacy
+auth.GasTipCap= gasTipCap   // EIP-1559
+auth.GasFeeCap= gasFeeCap   // EIP-1559
+auth.Value    = big.NewInt(0)// 附带的 ETH 数量
+
+tx, err := token.Transfer(auth, toAddr, amount)
+
+// 模拟调用（不上链，只看结果）
+auth.NoSend = true  // 设置 NoSend，只构建不发送
+tx, err := token.Transfer(auth, toAddr, amount)
+
+// ── 手动 CallContract ────────────────────────────────
+result, err := client.CallContract(ctx, ethereum.CallMsg{
+    From: fromAddr,
+    To:   &contractAddr,
+    Data: calldata,
+}, nil)
+```
+
+  12) Keystore（本地密钥管理）
+
+```
+// 创建 keystore
+ks := keystore.NewKeyStore("./keystore", keystore.StandardScryptN, keystore.StandardScryptP)
+
+// 创建新账户
+account, err := ks.NewAccount("密码")
+
+// 导入私钥
+account, err := ks.ImportECDSA(privateKey, "密码")
+
+// 解锁账户
+err := ks.Unlock(account, "密码")
+
+// 用 keystore 签名交易
+signedTx, err := ks.SignTx(account, tx, chainID)
+```
+
+   13) 常用的
+
+```
+查余额          → BalanceAt
+查交易状态      → TransactionReceipt
+读合约数据      → token.BalanceOf(CallOpts)  或  CallContract
+写合约          → token.Transfer(TransactOpts)
+发 ETH          → 构建 tx + SignTx + SendTransaction
+订阅事件        → SubscribeFilterLogs
+历史事件        → FilterLogs
+签名验证        → crypto.Sign + crypto.SigToPub
+等待确认        → 轮询 TransactionReceipt
+批量查询        → rpcClient.BatchCallContext
+```
